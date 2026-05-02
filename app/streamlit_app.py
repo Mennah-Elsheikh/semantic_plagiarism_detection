@@ -1,7 +1,10 @@
+import re
+import pickle
+import numpy as np
 import streamlit as st
-import requests
 import pandas as pd
-import time
+from pathlib import Path
+from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 
 # ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
@@ -11,7 +14,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-API_URL = "http://localhost:8000"
+# ── Paths ─────────────────────────────────────────────────────────────
+ROOT        = Path(__file__).resolve().parent.parent
+MODEL_PATH  = ROOT / "artifacts" / "plagiarism_dnn.keras"
+SCALER_PATH = ROOT / "artifacts" / "feature_scaler.pkl"
 
 # ── Custom CSS ────────────────────────────────────────────────────────
 st.markdown("""
@@ -144,6 +150,7 @@ section[data-testid="stSidebar"] {
 /* Status dot */
 .status-ok   { color: #34d399; font-weight: 600; }
 .status-err  { color: #f87171; font-weight: 600; }
+.status-loading { color: #fbbf24; font-weight: 600; }
 
 /* History table */
 .stDataFrame { border-radius: 12px; overflow: hidden; }
@@ -154,13 +161,58 @@ section[data-testid="stSidebar"] {
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# ── API health check ──────────────────────────────────────────────────
-def check_api():
+# ── Model loading (cached — runs only once per session) ───────────────
+@st.cache_resource(show_spinner=False)
+def load_models():
+    """Load encoder, DNN, and scaler. Cached so they load only once."""
+    from sentence_transformers import SentenceTransformer
+    import tensorflow as tf
+
+    encoder = SentenceTransformer("all-mpnet-base-v2")
+    dnn     = tf.keras.models.load_model(str(MODEL_PATH))
+    with open(SCALER_PATH, "rb") as f:
+        scaler = pickle.load(f)
+    return encoder, dnn, scaler
+
+# ── Helpers ───────────────────────────────────────────────────────────
+def preprocess(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def build_features(e1: np.ndarray, e2: np.ndarray):
+    abs_diff = np.abs(e1 - e2)
+    mult     = e1 * e2
+    cosine   = cos_sim(e1, e2)[0][0]
+    cos      = np.array([[cosine]])
+    return np.hstack([e1, e2, abs_diff, mult, cos]), float(cosine)
+
+def run_prediction(text1: str, text2: str, threshold: float, encoder, dnn, scaler):
+    t1 = preprocess(text1)
+    t2 = preprocess(text2)
+    e1 = encoder.encode([t1])
+    e2 = encoder.encode([t2])
+    features, cosine = build_features(e1, e2)
+    features_scaled  = scaler.transform(features)
+    prob             = float(dnn.predict(features_scaled, verbose=0)[0][0])
+    is_plagiarised   = prob >= threshold
+    return {
+        "prediction":       "Plagiarised" if is_plagiarised else "Not Plagiarised",
+        "is_plagiarised":   is_plagiarised,
+        "confidence":       round(prob, 4),
+        "confidence_pct":   f"{prob * 100:.2f}%",
+        "cosine_similarity": round(cosine, 4),
+        "threshold_used":   threshold,
+    }
+
+# ── Load models (shows spinner once on cold start) ────────────────────
+with st.spinner("🔄 Loading models — this takes ~20 s on first run…"):
     try:
-        r = requests.get(f"{API_URL}/health", timeout=2)
-        return r.status_code == 200
-    except Exception:
-        return False
+        encoder, dnn, scaler = load_models()
+        models_ready = True
+    except Exception as load_err:
+        models_ready = False
+        model_error  = str(load_err)
 
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
@@ -169,15 +221,14 @@ with st.sidebar:
         "Decision Threshold",
         min_value=0.30, max_value=0.95,
         value=0.60, step=0.05,
-        help="Probability above which text is flagged as plagiarised."
+        help="Probability above which text is flagged as plagiarised.",
     )
     st.markdown("---")
 
-    api_ok = check_api()
-    if api_ok:
-        st.markdown('<p class="status-ok">● API Online</p>', unsafe_allow_html=True)
+    if models_ready:
+        st.markdown('<p class="status-ok">● Models Loaded — Ready</p>', unsafe_allow_html=True)
     else:
-        st.markdown('<p class="status-err">● API Offline — start api.py</p>', unsafe_allow_html=True)
+        st.markdown('<p class="status-err">● Model Load Failed</p>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### Model Info")
@@ -198,6 +249,12 @@ st.markdown("""
     <p>Semantic similarity powered by MPNet Transformers + Deep Neural Network</p>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Model load error banner ───────────────────────────────────────────
+if not models_ready:
+    st.error(f"⚠️ Could not load models: {model_error}\n\n"
+             "Make sure `artifacts/plagiarism_dnn.keras` and `artifacts/feature_scaler.pkl` exist.")
+    st.stop()
 
 # ── Input area ────────────────────────────────────────────────────────
 col1, col2 = st.columns(2, gap="large")
@@ -228,17 +285,10 @@ with btn_col:
 if analyze:
     if not text1.strip() or not text2.strip():
         st.warning("Please enter text in both fields before analyzing.")
-    elif not api_ok:
-        st.error("Cannot connect to the API. Make sure api.py is running.")
     else:
-        with st.spinner("Analyzing..."):
+        with st.spinner("Analyzing…"):
             try:
-                resp = requests.post(
-                    f"{API_URL}/predict",
-                    json={"text1": text1, "text2": text2, "threshold": threshold},
-                    timeout=30,
-                )
-                result = resp.json()
+                result = run_prediction(text1, text2, threshold, encoder, dnn, scaler)
 
                 # ── Verdict ───────────────────────────────────────────
                 badge_class = "verdict-plagiarised" if result["is_plagiarised"] else "verdict-clean"
@@ -290,7 +340,7 @@ if analyze:
                 })
 
             except Exception as e:
-                st.error(f"API error: {e}")
+                st.error(f"Inference error: {e}")
 
 # ── History ───────────────────────────────────────────────────────────
 if st.session_state.history:
