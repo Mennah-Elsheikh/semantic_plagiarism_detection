@@ -4,7 +4,6 @@ import numpy as np
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 
 # ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
@@ -16,7 +15,7 @@ st.set_page_config(
 
 # ── Paths ─────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).resolve().parent.parent
-MODEL_PATH  = ROOT / "artifacts" / "plagiarism_dnn.keras"
+ONNX_PATH   = ROOT / "artifacts" / "plagiarism_dnn.onnx"
 SCALER_PATH = ROOT / "artifacts" / "feature_scaler.pkl"
 
 # ── Custom CSS ────────────────────────────────────────────────────────
@@ -150,7 +149,6 @@ section[data-testid="stSidebar"] {
 /* Status dot */
 .status-ok   { color: #34d399; font-weight: 600; }
 .status-err  { color: #f87171; font-weight: 600; }
-.status-loading { color: #fbbf24; font-weight: 600; }
 
 /* History table */
 .stDataFrame { border-radius: 12px; overflow: hidden; }
@@ -161,58 +159,61 @@ section[data-testid="stSidebar"] {
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# ── Cosine similarity (pure NumPy — no sklearn needed) ────────────────
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a, b = a.flatten(), b.flatten()
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
 # ── Model loading (cached — runs only once per session) ───────────────
 @st.cache_resource(show_spinner=False)
 def load_models():
-    """Load encoder, DNN, and scaler. Cached so they load only once."""
+    """Load sentence encoder, ONNX DNN, and scaler. Cached for the session."""
     from sentence_transformers import SentenceTransformer
-    import tensorflow as tf
+    import onnxruntime as ort
 
     encoder = SentenceTransformer("all-mpnet-base-v2")
-    dnn     = tf.keras.models.load_model(str(MODEL_PATH))
+    sess    = ort.InferenceSession(str(ONNX_PATH))
     with open(SCALER_PATH, "rb") as f:
         scaler = pickle.load(f)
-    return encoder, dnn, scaler
+    # Store the ONNX input name so inference doesn't re-query it every time
+    input_name = sess.get_inputs()[0].name
+    return encoder, sess, scaler, input_name
 
 # ── Helpers ───────────────────────────────────────────────────────────
 def preprocess(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text.lower()).strip()
 
 def build_features(e1: np.ndarray, e2: np.ndarray):
+    cosine   = cosine_sim(e1, e2)
     abs_diff = np.abs(e1 - e2)
     mult     = e1 * e2
-    cosine   = cos_sim(e1, e2)[0][0]
-    cos      = np.array([[cosine]])
-    return np.hstack([e1, e2, abs_diff, mult, cos]), float(cosine)
+    cos_arr  = np.array([[cosine]])
+    return np.hstack([e1, e2, abs_diff, mult, cos_arr]), cosine
 
-def run_prediction(text1: str, text2: str, threshold: float, encoder, dnn, scaler):
-    t1 = preprocess(text1)
-    t2 = preprocess(text2)
-    e1 = encoder.encode([t1])
-    e2 = encoder.encode([t2])
+def run_prediction(text1, text2, threshold, encoder, sess, scaler, input_name):
+    e1 = encoder.encode([preprocess(text1)])
+    e2 = encoder.encode([preprocess(text2)])
     features, cosine = build_features(e1, e2)
-    features_scaled  = scaler.transform(features)
-    prob             = float(dnn.predict(features_scaled, verbose=0)[0][0])
+    features_scaled  = scaler.transform(features).astype(np.float32)
+    prob             = float(sess.run(None, {input_name: features_scaled})[0].flat[0])
     is_plagiarised   = prob >= threshold
     return {
-        "prediction":       "Plagiarised" if is_plagiarised else "Not Plagiarised",
-        "is_plagiarised":   is_plagiarised,
-        "confidence":       round(prob, 4),
-        "confidence_pct":   f"{prob * 100:.2f}%",
+        "is_plagiarised":    is_plagiarised,
+        "confidence":        round(prob, 4),
+        "confidence_pct":    f"{prob * 100:.2f}%",
         "cosine_similarity": round(cosine, 4),
-        "threshold_used":   threshold,
+        "threshold_used":    threshold,
     }
 
-# ── Load models (shows spinner once on cold start) ────────────────────
-with st.spinner("🔄 Loading models — this takes ~20 s on first run…"):
+# ── Load models ───────────────────────────────────────────────────────
+with st.spinner("Loading models — first run takes ~30 s..."):
     try:
-        encoder, dnn, scaler = load_models()
+        encoder, sess, scaler, input_name = load_models()
         models_ready = True
-    except Exception as load_err:
+    except Exception as e:
         models_ready = False
-        model_error  = str(load_err)
+        model_error  = str(e)
 
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
@@ -226,16 +227,16 @@ with st.sidebar:
     st.markdown("---")
 
     if models_ready:
-        st.markdown('<p class="status-ok">● Models Loaded — Ready</p>', unsafe_allow_html=True)
+        st.markdown('<p class="status-ok">&#9679; Models Loaded &mdash; Ready</p>', unsafe_allow_html=True)
     else:
-        st.markdown('<p class="status-err">● Model Load Failed</p>', unsafe_allow_html=True)
+        st.markdown('<p class="status-err">&#9679; Model Load Failed</p>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### Model Info")
     st.markdown("- **Encoder:** all-mpnet-base-v2")
-    st.markdown("- **Classifier:** DNN (512→256→128)")
+    st.markdown("- **Classifier:** DNN (512&rarr;256&rarr;128)")
     st.markdown("- **Features:** 3073-dim")
-    st.markdown("- **CV F1:** 94.19% ± 1.82%")
+    st.markdown("- **CV F1:** 94.19% &plusmn; 1.82%")
 
     st.markdown("---")
     if st.button("🗑️ Clear History"):
@@ -245,15 +246,14 @@ with st.sidebar:
 # ── Hero header ───────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
-    <h1>🔍 Plagiarism Detector</h1>
+    <h1>&#128269; Plagiarism Detector</h1>
     <p>Semantic similarity powered by MPNet Transformers + Deep Neural Network</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Model load error banner ───────────────────────────────────────────
 if not models_ready:
-    st.error(f"⚠️ Could not load models: {model_error}\n\n"
-             "Make sure `artifacts/plagiarism_dnn.keras` and `artifacts/feature_scaler.pkl` exist.")
+    st.error(f"Could not load models: {model_error}\n\n"
+             "Ensure `artifacts/plagiarism_dnn.onnx` and `artifacts/feature_scaler.pkl` exist.")
     st.stop()
 
 # ── Input area ────────────────────────────────────────────────────────
@@ -261,20 +261,16 @@ col1, col2 = st.columns(2, gap="large")
 with col1:
     st.markdown("#### 📄 Original Text")
     text1 = st.text_area(
-        label="text1",
-        label_visibility="collapsed",
+        label="text1", label_visibility="collapsed",
         placeholder="Paste or type the original text here...",
-        height=220,
-        key="text1",
+        height=220, key="text1",
     )
 with col2:
     st.markdown("#### 📝 Suspicious Text")
     text2 = st.text_area(
-        label="text2",
-        label_visibility="collapsed",
+        label="text2", label_visibility="collapsed",
         placeholder="Paste or type the text to check for plagiarism...",
-        height=220,
-        key="text2",
+        height=220, key="text2",
     )
 
 _, btn_col, _ = st.columns([1, 2, 1])
@@ -286,13 +282,15 @@ if analyze:
     if not text1.strip() or not text2.strip():
         st.warning("Please enter text in both fields before analyzing.")
     else:
-        with st.spinner("Analyzing…"):
+        with st.spinner("Analyzing..."):
             try:
-                result = run_prediction(text1, text2, threshold, encoder, dnn, scaler)
+                result = run_prediction(
+                    text1, text2, threshold,
+                    encoder, sess, scaler, input_name
+                )
 
-                # ── Verdict ───────────────────────────────────────────
                 badge_class = "verdict-plagiarised" if result["is_plagiarised"] else "verdict-clean"
-                icon = "⚠️ PLAGIARISED" if result["is_plagiarised"] else "✅ ORIGINAL"
+                icon = "&#9888;&#65039; PLAGIARISED" if result["is_plagiarised"] else "&#9989; ORIGINAL"
 
                 st.markdown(f"""
                 <div class="result-card">
@@ -316,10 +314,9 @@ if analyze:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ── Confidence bar ────────────────────────────────────
-                st.markdown("#### Confidence Level")
                 conf = result["confidence"]
                 bar_color = "#ef4444" if result["is_plagiarised"] else "#10b981"
+                st.markdown("#### Confidence Level")
                 st.markdown(f"""
                 <div style="background:rgba(255,255,255,0.07);border-radius:10px;height:18px;overflow:hidden;margin-top:0.3rem;">
                     <div style="width:{conf*100:.1f}%;height:100%;background:{bar_color};border-radius:10px;
@@ -330,9 +327,9 @@ if analyze:
                 </p>
                 """, unsafe_allow_html=True)
 
-                # ── Save to history ───────────────────────────────────
+                display_icon = "PLAGIARISED" if result["is_plagiarised"] else "ORIGINAL"
                 st.session_state.history.insert(0, {
-                    "Result": icon,
+                    "Result": display_icon,
                     "Confidence": result["confidence_pct"],
                     "Cosine Sim": f"{result['cosine_similarity']:.4f}",
                     "Text 1 (preview)": text1[:50] + "..." if len(text1) > 50 else text1,
